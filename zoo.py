@@ -136,6 +136,9 @@ class Qwen3VLEmbeddingModelConfig(fout.TorchImageModelConfig):
         self.max_pixels = self.parse_number(d, "max_pixels", default=1800 * 32 * 32)
         self.total_pixels = self.parse_number(d, "total_pixels", default=10 * 768 * 32 * 32)
         
+        # Tokenizer settings
+        self.max_length = self.parse_number(d, "max_length", default=8192)
+        
         # Classification settings
         self.text_prompt = self.parse_string(d, "text_prompt", default="")
 
@@ -311,6 +314,22 @@ class Qwen3VLEmbeddingModel(fom.Model, fom.PromptMixin, SupportsGetItem, TorchMo
         """Set total pixel budget."""
         self.config.total_pixels = value
     
+    @property
+    def max_length(self):
+        """Maximum token sequence length for the tokenizer."""
+        return self.config.max_length
+    
+    @max_length.setter
+    def max_length(self, value):
+        """Set max token length.
+        
+        If the embedder is already loaded, updates it directly so the change
+        takes effect immediately without reloading the model.
+        """
+        self.config.max_length = value
+        if self._embedder is not None:
+            self._embedder.max_length = value
+    
     @media_type.setter
     def media_type(self, value):
         """Set media type (video or image).
@@ -358,6 +377,7 @@ class Qwen3VLEmbeddingModel(fom.Model, fom.PromptMixin, SupportsGetItem, TorchMo
         logger.info(f"Loading Qwen3-VL-Embedding from {self.config.model_path}")
         
         embedder_kwargs = {
+            "max_length": self.config.max_length,
             "min_pixels": self.config.min_pixels,
             "max_pixels": self.config.max_pixels,
             "total_pixels": self.config.total_pixels,
