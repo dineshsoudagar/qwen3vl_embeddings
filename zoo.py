@@ -34,6 +34,10 @@ import fiftyone.core.models as fom
 import fiftyone.utils.torch as fout
 from fiftyone.core.models import SupportsGetItem, TorchModelMixin
 from fiftyone.utils.torch import GetItem, ClassifierOutputProcessor
+import os
+import tempfile
+from io import BytesIO
+from pathlib import Path
 
 from .qwen3_vl_embedding import Qwen3VLEmbedder
 
@@ -57,6 +61,112 @@ def get_device():
         return "mps"
     return "cpu"
 
+def _mkstemp_path(self, suffix: str) -> str:
+    fd, p = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    return p
+
+
+def _normalize_to_uint8(self, arr: np.ndarray) -> np.ndarray:
+    a = arr
+    if a.dtype == np.uint8:
+        return a
+
+    if np.issubdtype(a.dtype, np.floating):
+        a = np.clip(a, 0.0, 1.0)
+        a = (a * 255.0).round().astype(np.uint8)
+        return a
+
+    return np.clip(a, 0, 255).astype(np.uint8)
+
+
+def _write_png(self, arr: np.ndarray, path: str) -> None:
+    a = self._normalize_to_uint8(arr)
+
+    try:
+        from PIL import Image
+
+        if a.ndim == 2:
+            Image.fromarray(a, mode="L").save(path, format="PNG")
+            return
+
+        if a.ndim == 3 and a.shape[2] == 1:
+            Image.fromarray(a[:, :, 0], mode="L").save(path, format="PNG")
+            return
+
+        if a.ndim == 3 and a.shape[2] in (3, 4):
+            Image.fromarray(a[:, :, :3], mode="RGB").save(path, format="PNG")
+            return
+
+        raise ValueError(f"Unsupported image array shape: {a.shape}")
+
+    except Exception:
+        import cv2
+
+        if a.ndim == 2:
+            ok = cv2.imwrite(path, a)
+            if not ok:
+                raise ValueError("Failed to write image to disk")
+            return
+
+        if a.ndim == 3 and a.shape[2] == 1:
+            ok = cv2.imwrite(path, a[:, :, 0])
+            if not ok:
+                raise ValueError("Failed to write image to disk")
+            return
+
+        if a.ndim == 3 and a.shape[2] in (3, 4):
+            rgb = a[:, :, :3]
+            bgr = rgb[:, :, ::-1]
+            ok = cv2.imwrite(path, bgr)
+            if not ok:
+                raise ValueError("Failed to write image to disk")
+            return
+
+        raise ValueError(f"Unsupported image array shape: {a.shape}")
+
+
+def _extract_media_path_and_type(self, media):
+    cleanup = None
+
+    if isinstance(media, dict):
+        p = media.get("filepath")
+        if not p:
+            raise ValueError("Expected dict with 'filepath'")
+        return p, cleanup, self.config.media_type
+
+    if isinstance(media, (str, os.PathLike)):
+        return str(media), cleanup, self.config.media_type
+
+    if hasattr(media, "inpath"):
+        return media.inpath, cleanup, self.config.media_type
+
+    if isinstance(media, np.ndarray):
+        p = self._mkstemp_path(".png")
+        self._write_png(media, p)
+        return p, p, "image"
+
+    if isinstance(media, (bytes, bytearray, memoryview)):
+        b = bytes(media)
+        try:
+            from PIL import Image
+            img = Image.open(BytesIO(b)).convert("RGB")
+            p = self._mkstemp_path(".png")
+            img.save(p, format="PNG")
+            return p, p, "image"
+        except Exception:
+            raise TypeError("Byte input is not a valid image; video bytes not supported yet")
+
+    try:
+        from PIL.Image import Image as PILImageType
+        if isinstance(media, PILImageType):
+            p = self._mkstemp_path(".png")
+            media.convert("RGB").save(p, format="PNG")
+            return p, p, "image"
+    except Exception:
+        pass
+
+    raise TypeError(f"Unsupported media input type: {type(media)}")
 
 class Qwen3VLEmbeddingGetItem(GetItem):
     """GetItem transform for Qwen3-VL embedding model.
@@ -417,8 +527,8 @@ class Qwen3VLEmbeddingModel(fom.Model, fom.PromptMixin, SupportsGetItem, TorchMo
             return media
         # FFmpegVideoReader stores path in inpath
         return media.inpath
-    
-    def _prepare_embedder_input(self, filepath):
+
+    def _prepare_embedder_input(self, media_type, filepath):
         """Prepare input dict for Qwen3VLEmbedder.process().
         
         Uses config.media_type to determine input format.
@@ -429,63 +539,64 @@ class Qwen3VLEmbeddingModel(fom.Model, fom.PromptMixin, SupportsGetItem, TorchMo
         Returns:
             dict: Input dict for embedder.process()
         """
-        if self.config.media_type == "video":
+        if media_type == "video":
             return {
                 "video": filepath,
                 "fps": self.config.fps,
                 "max_frames": self.config.max_frames,
             }
-        else:
-            return {
-                "image": filepath,
-            }
+
+        return {"image": filepath}
     
     # =========================================================================
     # Video/Image embedding methods
     # =========================================================================
-    
+
     def embed(self, media):
-        """Embed a single video or image.
-        
-        Args:
-            media: Video/image reader object or string filepath
-        
-        Returns:
-            numpy.ndarray: 1D embedding vector
-        """
         if self._embedder is None:
             self._load_model()
-        
-        filepath = self._extract_media_path(media)
-        input_dict = self._prepare_embedder_input(filepath)
-        
-        with torch.no_grad():
-            embedding = self._embedder.process([input_dict])
-            result = embedding[0].cpu().float().numpy()
-        
+
+        filepath, cleanup, media_type = self._extract_media_path_and_type(media)
+        input_dict = self._prepare_embedder_input(media_type, filepath)
+
+        try:
+            with torch.no_grad():
+                embedding = self._embedder.process([input_dict])
+                result = embedding[0].cpu().float().numpy()
+        finally:
+            if cleanup is not None:
+                try:
+                    os.remove(cleanup)
+                except Exception:
+                    pass
+
         self._last_computed_embeddings = result.reshape(1, -1)
         return result
-    
+
     def embed_all(self, medias):
-        """Embed multiple videos or images.
-        
-        Args:
-            medias: List of video/image readers or dicts from GetItem
-        
-        Returns:
-            numpy.ndarray: 2D embeddings with shape (batch_size, hidden_dim)
-        """
         if self._embedder is None:
             self._load_model()
-        
+
         embeddings = []
-        with torch.no_grad():
-            for media in medias:
-                filepath = self._extract_media_path(media)
-                input_dict = self._prepare_embedder_input(filepath)
-                embedding = self._embedder.process([input_dict])
-                embeddings.append(embedding[0].cpu().float().numpy())
-        
+        cleanups = []
+
+        try:
+            with torch.no_grad():
+                for media in medias:
+                    filepath, cleanup, media_type = self._extract_media_path_and_type(media)
+                    if cleanup is not None:
+                        cleanups.append(cleanup)
+
+                    input_dict = self._prepare_embedder_input(media_type, filepath)
+                    embedding = self._embedder.process([input_dict])
+                    embeddings.append(embedding[0].cpu().float().numpy())
+        finally:
+            for p in cleanups:
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
         result = np.stack(embeddings, axis=0)
         self._last_computed_embeddings = result
         return result
