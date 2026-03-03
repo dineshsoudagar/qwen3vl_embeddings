@@ -61,112 +61,6 @@ def get_device():
         return "mps"
     return "cpu"
 
-def _mkstemp_path(self, suffix: str) -> str:
-    fd, p = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    return p
-
-
-def _normalize_to_uint8(self, arr: np.ndarray) -> np.ndarray:
-    a = arr
-    if a.dtype == np.uint8:
-        return a
-
-    if np.issubdtype(a.dtype, np.floating):
-        a = np.clip(a, 0.0, 1.0)
-        a = (a * 255.0).round().astype(np.uint8)
-        return a
-
-    return np.clip(a, 0, 255).astype(np.uint8)
-
-
-def _write_png(self, arr: np.ndarray, path: str) -> None:
-    a = self._normalize_to_uint8(arr)
-
-    try:
-        from PIL import Image
-
-        if a.ndim == 2:
-            Image.fromarray(a, mode="L").save(path, format="PNG")
-            return
-
-        if a.ndim == 3 and a.shape[2] == 1:
-            Image.fromarray(a[:, :, 0], mode="L").save(path, format="PNG")
-            return
-
-        if a.ndim == 3 and a.shape[2] in (3, 4):
-            Image.fromarray(a[:, :, :3], mode="RGB").save(path, format="PNG")
-            return
-
-        raise ValueError(f"Unsupported image array shape: {a.shape}")
-
-    except Exception:
-        import cv2
-
-        if a.ndim == 2:
-            ok = cv2.imwrite(path, a)
-            if not ok:
-                raise ValueError("Failed to write image to disk")
-            return
-
-        if a.ndim == 3 and a.shape[2] == 1:
-            ok = cv2.imwrite(path, a[:, :, 0])
-            if not ok:
-                raise ValueError("Failed to write image to disk")
-            return
-
-        if a.ndim == 3 and a.shape[2] in (3, 4):
-            rgb = a[:, :, :3]
-            bgr = rgb[:, :, ::-1]
-            ok = cv2.imwrite(path, bgr)
-            if not ok:
-                raise ValueError("Failed to write image to disk")
-            return
-
-        raise ValueError(f"Unsupported image array shape: {a.shape}")
-
-
-def _extract_media_path_and_type(self, media):
-    cleanup = None
-
-    if isinstance(media, dict):
-        p = media.get("filepath")
-        if not p:
-            raise ValueError("Expected dict with 'filepath'")
-        return p, cleanup, self.config.media_type
-
-    if isinstance(media, (str, os.PathLike)):
-        return str(media), cleanup, self.config.media_type
-
-    if hasattr(media, "inpath"):
-        return media.inpath, cleanup, self.config.media_type
-
-    if isinstance(media, np.ndarray):
-        p = self._mkstemp_path(".png")
-        self._write_png(media, p)
-        return p, p, "image"
-
-    if isinstance(media, (bytes, bytearray, memoryview)):
-        b = bytes(media)
-        try:
-            from PIL import Image
-            img = Image.open(BytesIO(b)).convert("RGB")
-            p = self._mkstemp_path(".png")
-            img.save(p, format="PNG")
-            return p, p, "image"
-        except Exception:
-            raise TypeError("Byte input is not a valid image; video bytes not supported yet")
-
-    try:
-        from PIL.Image import Image as PILImageType
-        if isinstance(media, PILImageType):
-            p = self._mkstemp_path(".png")
-            media.convert("RGB").save(p, format="PNG")
-            return p, p, "image"
-    except Exception:
-        pass
-
-    raise TypeError(f"Unsupported media input type: {type(media)}")
 
 class Qwen3VLEmbeddingGetItem(GetItem):
     """GetItem transform for Qwen3-VL embedding model.
@@ -289,7 +183,9 @@ class Qwen3VLEmbeddingModel(fom.Model, fom.PromptMixin, SupportsGetItem, TorchMo
     # =========================================================================
     # Required properties from Model base class
     # =========================================================================
-    
+
+
+
     @property
     def media_type(self):
         """Media type this model operates on."""
@@ -511,7 +407,81 @@ class Qwen3VLEmbeddingModel(fom.Model, fom.PromptMixin, SupportsGetItem, TorchMo
     # =========================================================================
     # Helper methods
     # =========================================================================
-    
+    def _mkstemp_path(self, suffix: str) -> str:
+        fd, p = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)
+        return p
+
+    def _normalize_to_uint8(self, arr: np.ndarray) -> np.ndarray:
+        a = arr
+        if a.dtype == np.uint8:
+            return a
+
+        if np.issubdtype(a.dtype, np.floating):
+            a = np.clip(a, 0.0, 1.0)
+            a = (a * 255.0).round().astype(np.uint8)
+            return a
+
+        return np.clip(a, 0, 255).astype(np.uint8)
+
+    def _write_png(self, arr: np.ndarray, path: str) -> None:
+        a = self._normalize_to_uint8(arr)
+
+        from PIL import Image
+
+        if a.ndim == 2:
+            Image.fromarray(a, mode="L").save(path, format="PNG")
+            return
+
+        if a.ndim == 3 and a.shape[2] == 1:
+            Image.fromarray(a[:, :, 0], mode="L").save(path, format="PNG")
+            return
+
+        if a.ndim == 3 and a.shape[2] in (3, 4):
+            Image.fromarray(a[:, :, :3], mode="RGB").save(path, format="PNG")
+            return
+
+        raise ValueError(f"Unsupported image array shape: {a.shape}")
+
+    def _extract_media_path_and_type(self, media):
+        cleanup = None
+
+        if isinstance(media, dict):
+            if "filepath" not in media:
+                raise ValueError("Expected dict with 'filepath'")
+            return media["filepath"], cleanup, self.config.media_type
+
+        if isinstance(media, (str, os.PathLike)):
+            return str(media), cleanup, self.config.media_type
+
+        if hasattr(media, "inpath"):
+            return media.inpath, cleanup, self.config.media_type
+
+        if isinstance(media, np.ndarray):
+            p = self._mkstemp_path(".png")
+            self._write_png(media, p)
+            return p, p, "image"
+
+        if isinstance(media, (bytes, bytearray, memoryview)):
+            from PIL import Image
+
+            b = bytes(media)
+            img = Image.open(BytesIO(b)).convert("RGB")
+            p = self._mkstemp_path(".png")
+            img.save(p, format="PNG")
+            return p, p, "image"
+
+        try:
+            from PIL.Image import Image as PILImageType
+            if isinstance(media, PILImageType):
+                p = self._mkstemp_path(".png")
+                media.convert("RGB").save(p, format="PNG")
+                return p, p, "image"
+        except Exception:
+            pass
+
+        raise TypeError(f"Unsupported media input type: {type(media)}")
+
     def _extract_media_path(self, media):
         """Extract filepath from media input.
         
